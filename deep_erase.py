@@ -40,6 +40,9 @@ PROBE_TIMEOUT = 5          # secondes, pour une sonde "ce binaire repond-il ?"
 INSTALL_TIMEOUT = 600      # secondes, pour l'installation reseau des paquets
 INFERENCE_TIMEOUT = 900    # secondes, plafond dur sur le calcul IA (anti boucle infinie / DoS)
 SELECTION_COVERAGE_WARN = 0.97  # avertir si la selection couvre >97% de l'image
+MASK_DILATION_PX = 6  # marge de securite (pixels) pour ne jamais laisser un reste de l'objet juste hors du masque
+MAX_CROP_SIZE = 900  # taille max du recadrage carre : limite le facteur de reduction/agrandissement vers les 512x512 du modele
+WHOLE_IMAGE_THRESHOLD = 1200  # en dessous de cette taille (plus grande dimension), on traite le cadre complet, jamais un recadrage local
 
 MAX_MODEL_FILE_BYTES = 800 * 1024 * 1024   # 800 Mo : tres au-dessus des ~200 Mo documentes
 MAX_GRAPH_NODES = 50_000                    # tres au-dessus d'un LaMa reel (quelques centaines/milliers)
@@ -521,6 +524,16 @@ def process_image(img_in, mask_in, img_out, plugin_directory, force_opencv_fallb
         print("Erreur : Le masque genere est vide.", file=sys.stderr)
         sys.exit(1)
 
+    # Dilatation de securite : une selection collant tres pres du bord reel
+    # de l'objet (ou l'effleurant) laisserait sinon des pixels de l'objet
+    # juste hors du masque. Le fondu de bord ci-dessous melangerait alors
+    # ces pixels dans la zone de transition, faisant reapparaitre un
+    # "fantome" translucide de l'objet qu'on cherche justement a effacer.
+    # En elargissant legerement le masque, la zone de transition demarre
+    # toujours en territoire sur, deja hors de l'objet.
+    dilation_kernel = np.ones(({MASK_DILATION_PX} * 2 + 1, {MASK_DILATION_PX} * 2 + 1), np.uint8)
+    binary_mask = cv2.dilate(binary_mask, dilation_kernel, iterations=1)
+
     # ---------------------------------------------------------
     # ADAPTATEUR TENSORIEL (LaMa ONNX)
     # ---------------------------------------------------------
@@ -608,11 +621,91 @@ def process_image(img_in, mask_in, img_out, plugin_directory, force_opencv_fallb
 
             h, w = img.shape[:2]
 
+            # ---------------------------------------------------------
+            # RECADRAGE INTELLIGENT AUTOUR DE LA SELECTION
+            # ---------------------------------------------------------
+            # Le modele n'accepte qu'une image 512x512. Pour une GRANDE
+            # photo, redimensionner l'image ENTIERE degraderait toute la
+            # photo et ecraserait les details fins dans le masque (cas de
+            # l'eolienne). On recadre alors une zone locale autour de la
+            # selection, avec du contexte.
+            # Mais pour une image DEJA proche de 512x512, ce recadrage local
+            # peut au contraire couper une structure importante proche de
+            # l'objet (ex: l'arche d'une fenetre ronde) hors du champ vu par
+            # l'IA, qui perd alors la comprehension geometrique de la scene.
+            # Dans ce cas, mieux vaut traiter le cadre COMPLET, exactement
+            # comme le fait la demo officielle du modele.
+            h_full, w_full = h, w
+            ys, xs = np.where(binary_mask > 0)
+            bbox_x0, bbox_x1 = int(xs.min()), int(xs.max()) + 1
+            bbox_y0, bbox_y1 = int(ys.min()), int(ys.max()) + 1
+            bbox_w, bbox_h = bbox_x1 - bbox_x0, bbox_y1 - bbox_y0
+
+            if max(w_full, h_full) <= {WHOLE_IMAGE_THRESHOLD}:
+                # Image assez petite : le facteur de reduction vers 512x512
+                # reste raisonnable meme en traitant tout le cadre, donc on
+                # ne perd aucune structure de la scene.
+                crop_x0, crop_y0, crop_x1, crop_y1 = 0, 0, w_full, h_full
+            else:
+                context_pad = max(80, int(max(bbox_w, bbox_h) * 0.75))
+
+                # Plafond de taille : sans cela, un grand objet (ex: un mat
+                # d'eolienne de 600px de haut) produirait un recadrage bien
+                # plus grand que 512x512, impliquant une reduction/agrandissement
+                # important (x3 ou plus) et donc une texture reconstruite floue
+                # ou "en blocs" une fois remise a l'echelle reelle. On reduit la
+                # marge de contexte si besoin pour rester proche de la
+                # resolution native du modele, sans jamais rogner l'objet
+                # lui-meme (le plancher de contexte descend a 20px seulement si
+                # l'objet est deja plus grand que MAX_CROP_SIZE).
+                max_object_dim = max(bbox_w, bbox_h)
+                if max_object_dim + 2 * context_pad > {MAX_CROP_SIZE}:
+                    context_pad = max(20, ({MAX_CROP_SIZE} - max_object_dim) // 2)
+
+                crop_x0 = bbox_x0 - context_pad
+                crop_y0 = bbox_y0 - context_pad
+                crop_x1 = bbox_x1 + context_pad
+                crop_y1 = bbox_y1 + context_pad
+
+            # Rendre le recadrage carre (evite toute distorsion d'aspect au
+            # redimensionnement vers 512x512) en etendant le cote le plus court.
+            crop_w = crop_x1 - crop_x0
+            crop_h = crop_y1 - crop_y0
+            if crop_w > crop_h:
+                extra = (crop_w - crop_h) // 2
+                crop_y0 -= extra
+                crop_y1 += (crop_w - crop_h) - extra
+            elif crop_h > crop_w:
+                extra = (crop_h - crop_w) // 2
+                crop_x0 -= extra
+                crop_x1 += (crop_h - crop_w) - extra
+
+            # La zone peut deborder des limites reelles de l'image : on
+            # complete par reflet (contexte visuel) plutot que de rogner,
+            # pour conserver un recadrage carre sans distorsion. Le masque,
+            # lui, est complete par du noir (aucune zone a effacer dans le
+            # contexte ajoute).
+            pad_left = max(0, -crop_x0)
+            pad_top = max(0, -crop_y0)
+            pad_right = max(0, crop_x1 - w)
+            pad_bottom = max(0, crop_y1 - h)
+
+            padded_img = cv2.copyMakeBorder(img, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT)
+            padded_mask = cv2.copyMakeBorder(binary_mask, pad_top, pad_bottom, pad_left, pad_right,
+                                              cv2.BORDER_CONSTANT, value=0)
+
+            local_x0 = crop_x0 + pad_left
+            local_y0 = crop_y0 + pad_top
+            crop_img = padded_img[local_y0:local_y0 + crop_h, local_x0:local_x0 + crop_w]
+            crop_mask = padded_mask[local_y0:local_y0 + crop_h, local_x0:local_x0 + crop_w]
+
             # Ordre des tentatives : la taille declaree dans le graphe (si
             # elle est vraiment statique), puis 512x512 (taille documentee
             # de reference pour ce modele), puis un pad dynamique au
             # multiple de 32 en tout dernier recours pour d'autres variantes
             # de LaMa qui accepteraient reellement une taille arbitraire.
+            # Ces tentatives portent desormais sur le RECADRAGE, plus sur
+            # l'image entiere.
             candidates = []
             if declared_h and declared_w:
                 candidates.append(("fixed", declared_h, declared_w))
@@ -620,18 +713,19 @@ def process_image(img_in, mask_in, img_out, plugin_directory, force_opencv_fallb
                 candidates.append(("fixed", 512, 512))
             candidates.append(("pad32", None, None))
 
+            crop_result = None
             for mode, cand_h, cand_w in candidates:
                 try:
                     if mode == "fixed":
-                        work_img = cv2.resize(img, (cand_w, cand_h), interpolation=cv2.INTER_LANCZOS4)
-                        work_mask = cv2.resize(binary_mask, (cand_w, cand_h), interpolation=cv2.INTER_NEAREST)
-                        pad_h, pad_w = 0, 0
+                        work_img = cv2.resize(crop_img, (cand_w, cand_h), interpolation=cv2.INTER_LANCZOS4)
+                        work_mask = cv2.resize(crop_mask, (cand_w, cand_h), interpolation=cv2.INTER_NEAREST)
+                        inner_pad_h, inner_pad_w = 0, 0
                     else:
                         pad_size = 32
-                        pad_h = (pad_size - h % pad_size) % pad_size
-                        pad_w = (pad_size - w % pad_size) % pad_size
-                        work_img = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-                        work_mask = cv2.copyMakeBorder(binary_mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+                        inner_pad_h = (pad_size - crop_h % pad_size) % pad_size
+                        inner_pad_w = (pad_size - crop_w % pad_size) % pad_size
+                        work_img = cv2.copyMakeBorder(crop_img, 0, inner_pad_h, 0, inner_pad_w, cv2.BORDER_REFLECT)
+                        work_mask = cv2.copyMakeBorder(crop_mask, 0, inner_pad_h, 0, inner_pad_w, cv2.BORDER_REFLECT)
 
                     work_img_rgb = cv2.cvtColor(work_img, cv2.COLOR_BGR2RGB)
                     img_tensor = work_img_rgb.astype(np.float32) / 255.0
@@ -670,19 +764,46 @@ def process_image(img_in, mask_in, img_out, plugin_directory, force_opencv_fallb
                     result_ai = cv2.cvtColor(output_img, cv2.COLOR_RGB2BGR)
 
                     if mode == "fixed":
-                        result = cv2.resize(result_ai, (w, h), interpolation=cv2.INTER_LANCZOS4)
+                        crop_result = cv2.resize(result_ai, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
                     else:
-                        result = result_ai[:h, :w] if (pad_h > 0 or pad_w > 0) else result_ai
+                        crop_result = result_ai[:crop_h, :crop_w] if (inner_pad_h > 0 or inner_pad_w > 0) else result_ai
 
                     print("[ONNX_SUCCESS]")
                     break
                 except Exception as e:
                     last_onnx_error = str(e)
-                    result = None
+                    crop_result = None
                     continue
 
-            if result is None:
+            if crop_result is None:
                 raise RuntimeError(last_onnx_error or "Toutes les tailles candidates ont echoue.")
+
+            # ---------------------------------------------------------
+            # REINJECTION : uniquement la zone recadree, avec fondu au bord
+            # de la selection reelle. Tout le reste de l'image reste
+            # strictement identique aux pixels d'origine.
+            # ---------------------------------------------------------
+            result = img.copy()
+
+            # Fondu doux sur les bords de la selection (evite une couture
+            # visible), sans jamais toucher aux pixels hors selection.
+            mask_crop_f32 = crop_mask.astype(np.float32) / 255.0
+            feather_px = max(3, min(15, context_pad // 4))
+            k = feather_px * 2 + 1
+            mask_feathered = cv2.GaussianBlur(mask_crop_f32, (k, k), 0)
+            mask_feathered = np.clip(mask_feathered, 0.0, 1.0)[:, :, None]
+
+            blended_crop = (crop_result.astype(np.float32) * mask_feathered +
+                            crop_img.astype(np.float32) * (1.0 - mask_feathered)).astype(np.uint8)
+
+            # On ne reecrit que la portion du recadrage qui correspond a de
+            # vrais pixels de l'image (pas le contexte ajoute par reflet).
+            write_x0, write_y0 = max(0, crop_x0), max(0, crop_y0)
+            write_x1, write_y1 = min(w, crop_x1), min(h, crop_y1)
+            src_x0, src_y0 = write_x0 - crop_x0, write_y0 - crop_y0
+            src_x1, src_y1 = src_x0 + (write_x1 - write_x0), src_y0 + (write_y1 - write_y0)
+
+            result[write_y0:write_y1, write_x0:write_x1] = blended_crop[src_y0:src_y1, src_x0:src_x1]
         except Exception as e:
             result = None
             print(f"[ONNX_ERROR] {{str(e)}}", file=sys.stdout)
