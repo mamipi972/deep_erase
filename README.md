@@ -5,6 +5,7 @@
 Powered by the **LaMa** model (Large Mask Inpainting) via **ONNX Runtime**, this plugin uses a *"crash-proof"* architecture: the AI computation runs in a fully isolated environment, so GIMP itself never crashes — even if something goes wrong with the model.
 
 > 🇫🇷 A French version of this document is available in [`README.fr.md`](README.fr.md).
+<img width="2554" height="853" alt="image" src="https://github.com/user-attachments/assets/c0b9c0cd-d593-49d5-aa17-63746b2f2569" />
 
 ---
 
