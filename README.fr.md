@@ -5,6 +5,7 @@
 Propulsé par le modèle IA **LaMa** (*Large Mask Inpainting*) via **ONNX Runtime**, ce greffon bénéficie d'une architecture *« Crash-Proof »* : l'IA s'exécute dans un environnement totalement isolé, garantissant que GIMP ne plantera jamais — même en cas de problème avec le modèle.
 
 > 🇬🇧 A version anglaise de ce document est disponible dans [`README.md`](README.md).
+<img width="2554" height="853" alt="image" src="https://github.com/user-attachments/assets/358539e9-3429-48b7-8d6e-f06e67be5feb" />
 
 ---
 
